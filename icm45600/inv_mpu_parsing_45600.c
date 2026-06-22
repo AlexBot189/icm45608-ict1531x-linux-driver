@@ -27,7 +27,7 @@
 #include <linux/math64.h>
 
 #include "../inv_mpu_iio.h"
-#include "../edmp/inv_mpu_edmp_gaf.h"
+#include "inv_mpu_gaf.h"
 
 static int inv_check_fsync(struct inv_mpu_state *st)
 {
@@ -187,75 +187,8 @@ static int inv_push_45600_data(struct iio_dev *indio_dev, u8 *dptr)
 		valid_gyr = inv_validate_fifo_data(gyr_lsb);
 	}
 
-	if (st->sensor[SENSOR_COMPASS].on) {
-		/* Check if GAF is enabled for this compass */
-		if (st->plat_data.sec_slave_id == COMPASS_ID_ICT1531X) {
-			/* ES0 for GAF: 9 bytes = quat x,y,z (s16 LE each) + reserved */
-			if (st->sensor[SENSOR_GYRO].on || st->sensor[SENSOR_ACCEL].on)
-				d = dptr + 14;
-			else
-				d = dptr + 2;
-
-			if (header.bits.ext_header && header2.bits.es0_en &&
-			    header2.bits.es0_vld) {
-				u8 es0_data[9];
-				u8 es1_data[6];
-				struct gaf_fifo_output gaf_out;
-				int i;
-
-				/* ES0: 9 bytes */
-				for (i = 0; i < 9; i++)
-					es0_data[i] = d[i];
-
-				/* ES1: 6 bytes, right after ES0 */
-				if (st->sensor[SENSOR_PRESSURE].on &&
-				    header2.bits.es1_en && header2.bits.es1_vld) {
-					/* ES1 is used for pressure, skip GAF ES1 extraction */
-					/* GAF ES1 would be in ES0 area shifted... */
-					goto skip_gaf_decode;
-				}
-
-				/* ES1 for GAF: 6 bytes after ES0 or in ES1 zone
-				 * When only GAF is on (no pressure),
-				 * ES0 and ES1 are sequential */
-				{
-					u8 *es1_d;
-					if (st->sensor[SENSOR_GYRO].on ||
-					    st->sensor[SENSOR_ACCEL].on)
-						es1_d = dptr + 14 + 9;
-					else
-						es1_d = dptr + 2 + 9;
-					for (i = 0; i < 6; i++)
-						es1_data[i] = es1_d[i];
-				}
-
-				inv_mpu_edmp_gaf_decode_fifo(es0_data, es1_data,
-							     &gaf_out);
-
-				if (gaf_out.valid) {
-					/* Push GAF rotation vector (9-axis quat) */
-					inv_get_dmp_ts(st, SENSOR_COMPASS);
-					st->sensor[SENSOR_COMPASS].sample_calib++;
-					if (st->sensor[SENSOR_COMPASS].send &&
-					    (!st->ts_algo.first_drop_samples[SENSOR_COMPASS])) {
-						s32 raw[3];
-
-						raw[0] = gaf_out.quat_q14[1]; /* x */
-						raw[1] = gaf_out.quat_q14[2]; /* y */
-						raw[2] = gaf_out.quat_q14[3]; /* z */
-						inv_push_sensor(indio_dev, SENSOR_COMPASS,
-								st->sensor[SENSOR_COMPASS].ts,
-								raw);
-					}
-					if (st->ts_algo.first_drop_samples[SENSOR_COMPASS])
-						st->ts_algo.first_drop_samples[SENSOR_COMPASS]--;
-				}
-skip_gaf_decode:
-				;
-			}
-			goto after_mag;
-		}
-
+	/* GAF mode: ES0 carries fusion quaternion, not raw compass — skip */
+	if (st->sensor[SENSOR_COMPASS].on && !st->chip_config.gaf_enabled) {
 		if (st->sensor[SENSOR_GYRO].on || st->sensor[SENSOR_ACCEL].on)
 			d = dptr + 14;
 		else
@@ -293,10 +226,7 @@ skip_gaf_decode:
 		}
 	}
 
-
-after_mag:
 	if (st->sensor[SENSOR_PRESSURE].on) {
-
 		if (st->sensor[SENSOR_GYRO].on || st->sensor[SENSOR_ACCEL].on)
 			d = dptr + 14 + 9;
 		else if (st->sensor[SENSOR_COMPASS].on)
@@ -332,6 +262,92 @@ after_mag:
 			pr_debug("get pressure in ES1=%d, %d\n", pressure, ((pressure * 2000)>>17)*20+70000);
 			pressure = ((pressure * 2000)>>17)*20+70000;
 			pressure *= 100;
+		}
+	}
+
+	/* ─── GAF data extraction from ES0/ES1 ───
+	 * GAF firmware always outputs fusion data when enabled,
+	 * regardless of IIO compass/pressure sensor state. */
+	if (st->chip_config.gaf_enabled &&
+	    st->sensor[SENSOR_ACCEL].on && st->sensor[SENSOR_GYRO].on) {
+		if (header.bits.ext_header && header2.bits.es0_en && header2.bits.es1_en) {
+			u8 es0[9], es1[6];
+			struct inv_mpu_gaf_outputs gaf_out = {0};
+			int quat_q30[4];
+			int bias_q16[3];
+			u64 gaf_ts;
+
+			/* ES0 at dptr+14 (9B), ES1 at dptr+23 (6B) */
+			memcpy(es0, dptr + 14, 9);
+			memcpy(es1, dptr + 23, 6);
+
+			if (!inv_mpu_gaf_decode_fifo(st, es0, es1, &gaf_out) &&
+			    gaf_out.frame_complete) {
+				/* GRV quaternion: Q14 -> Q30 */
+				if (gaf_out.grv_quat_valid) {
+					quat_q30[0] = (int)gaf_out.grv_quat_q14[0] << 16;
+					quat_q30[1] = (int)gaf_out.grv_quat_q14[1] << 16;
+					quat_q30[2] = (int)gaf_out.grv_quat_q14[2] << 16;
+					quat_q30[3] = (int)gaf_out.grv_quat_q14[3] << 16;
+
+					gaf_ts = st->sensor[SENSOR_GYRO].ts;
+					inv_push_16bytes_buffer(indio_dev, SIXQUAT_HDR,
+						gaf_ts, quat_q30,
+						(s16)gaf_out.gyr_accuracy_flag);
+				}
+
+				/* Gyro bias: Q12 -> Q16 */
+				if (gaf_out.gyr_bias_valid) {
+					bias_q16[0] = (int)gaf_out.gyr_bias_q12[0] << 4;
+					bias_q16[1] = (int)gaf_out.gyr_bias_q12[1] << 4;
+					bias_q16[2] = (int)gaf_out.gyr_bias_q12[2] << 4;
+
+					gaf_ts = st->sensor[SENSOR_GYRO].ts;
+					inv_push_16bytes_buffer(indio_dev, GYRO_CALIB_HDR,
+						gaf_ts, bias_q16,
+						(s16)gaf_out.gyr_accuracy_flag);
+				}
+
+				/* 9-axis RV quaternion (Q14→Q30) + heading (Q11) */
+				if (gaf_out.rv_quat_valid) {
+					quat_q30[0] = (int)gaf_out.rv_quat_q14[0] << 16;
+					quat_q30[1] = (int)gaf_out.rv_quat_q14[1] << 16;
+					quat_q30[2] = (int)gaf_out.rv_quat_q14[2] << 16;
+					quat_q30[3] = (int)gaf_out.rv_quat_q14[3] << 16;
+
+					gaf_ts = st->sensor[SENSOR_GYRO].ts;
+					inv_push_16bytes_buffer(indio_dev, NINEQUAT_HDR,
+						gaf_ts, quat_q30,
+						gaf_out.rv_heading_q11);
+				}
+
+				/* Raw magnetometer (s16→s32) */
+				if (gaf_out.rmag_valid) {
+					int rmag[3];
+					rmag[0] = (int)gaf_out.rmag[0];
+					rmag[1] = (int)gaf_out.rmag[1];
+					rmag[2] = (int)gaf_out.rmag[2];
+
+					gaf_ts = st->sensor[SENSOR_GYRO].ts;
+					inv_push_16bytes_buffer(indio_dev, MAGRAW_HDR,
+						gaf_ts, rmag, 1);
+				}
+
+				/* Magnetometer bias (Q16 uT) + accuracy + anomalies */
+				if (gaf_out.mag_bias_valid) {
+					int magbias[3];
+					s16 mag_flags;
+					magbias[0] = gaf_out.mag_bias_q16[0];
+					magbias[1] = gaf_out.mag_bias_q16[1];
+					magbias[2] = gaf_out.mag_bias_q16[2];
+					mag_flags = (s16)((gaf_out.mag_accuracy_flag << 8) |
+							  (gaf_out.mag_anomalies & 0xff));
+
+					gaf_ts = st->sensor[SENSOR_GYRO].ts;
+					inv_push_16bytes_buffer(indio_dev, MAGBIAS_HDR,
+						gaf_ts, magbias, mag_flags);
+				}
+			}
 		}
 	}
 
@@ -373,7 +389,8 @@ after_mag:
 		}
 	}
 
-	if (st->sensor[SENSOR_COMPASS].on) {
+	/* GAF mode: compass data is delivered via GAF fusion output, skip raw push */
+	if (st->sensor[SENSOR_COMPASS].on && !st->chip_config.gaf_enabled) {
 		if(header.bits.ext_header && header2.bits.es0_en && valid_mag) {
 			inv_get_dmp_ts(st, SENSOR_COMPASS);
 			st->sensor[SENSOR_COMPASS].sample_calib++;
@@ -390,8 +407,6 @@ after_mag:
 		}
 	}
 
-
-after_mag:
 	if (st->sensor[SENSOR_PRESSURE].on) {
 		if(header.bits.ext_header && header2.bits.es1_en && header2.bits.es1_vld) {
 			inv_get_dmp_ts(st, SENSOR_PRESSURE);

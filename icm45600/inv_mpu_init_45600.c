@@ -12,7 +12,7 @@
  */
 #define pr_fmt(fmt) "inv_mpu: " fmt
 #include "../inv_mpu_iio.h"
-#include "../edmp/inv_mpu_edmp_gaf.h"
+#include "inv_mpu_gaf.h"
 
 static int inv_read_timebase(struct inv_mpu_state *st)
 {
@@ -459,23 +459,15 @@ int inv_mpu_initialize(struct inv_mpu_state *st)
 
 	inv_mpu_configure_dmp(st);
 
-	if (st->plat_data.sec_slave_type ==  SECONDARY_SLAVE_TYPE_COMPASS)
-		st->chip_config.has_compass = 1;
-	else
-		st->chip_config.has_compass = 0;
+	/* GAF-based mag: ICT1531x is always on AUX I2C, handled by inv_mpu_mag_init() */
+	st->chip_config.has_compass = 1;
 
 	if (st->plat_data.aux_slave_type ==  SECONDARY_SLAVE_TYPE_PRESSURE)
 		st->chip_config.has_pressure = 1;
 	else
 		st->chip_config.has_pressure = 0;
 
-	if (st->chip_config.has_compass) {
-		result = inv_mpu_setup_compass_slave(st);
-		if (result) {
-			pr_err("compass setup failed\n");
-			st->chip_config.has_compass = 0;
-		}
-	}
+	/* Skip old AKM compass slave setup - GAF handles mag via I2CM */
 
 	if (st->chip_config.has_pressure) {
 		result = inv_mpu_setup_pressure_slave(st);
@@ -528,54 +520,6 @@ int inv_mpu_initialize(struct inv_mpu_state *st)
 		return result;
 
 	init_mag_matrix(st);
-
-	/* Initialize GAF if ICT1531x magnetometer is present */
-	if (st->chip_config.has_compass &&
-	    st->plat_data.sec_slave_id == COMPASS_ID_ICT1531X) {
-		struct inv_gaf_params gaf_params;
-
-		gaf_params.acc_odr_us = GAF_DEFAULT_ACC_ODR_US;
-		gaf_params.gyr_odr_us = GAF_DEFAULT_GYR_ODR_US;
-		gaf_params.acc_pdr_us = GAF_DEFAULT_ACC_PDR_US;
-		gaf_params.gyr_pdr_us = GAF_DEFAULT_GYR_PDR_US;
-		gaf_params.mag_dt_us = GAF_DEFAULT_MAG_DT_US;
-		gaf_params.magcal_dt_us = GAF_DEFAULT_MAGCAL_DT_US;
-		gaf_params.run_spherical = 0;
-		gaf_params.pll_clock_variation = GAF_DEFAULT_PLL_CLK_VAR;
-
-		result = inv_mpu_edmp_gaf_set_params(st, &gaf_params);
-		if (result) {
-			pr_err("GAF params setup failed\n");
-		} else {
-			pr_info("GAF params configured\n");
-		}
-
-		/* Set default mounting matrix (identity) */
-		{
-			int identity[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-			inv_mpu_edmp_gaf_set_mounting_matrix(st, identity);
-		}
-
-		/* Set default soft-iron matrix (identity in Q30) */
-		{
-			int si_q30[9] = {
-				1 << 30, 0, 0,
-				0, 1 << 30, 0,
-				0, 0, 1 << 30
-			};
-			inv_mpu_edmp_gaf_set_soft_iron_matrix(st, si_q30);
-		}
-
-		/* Set gyro bias (zero initially) */
-		{
-			int gyr_bias[3] = {0, 0, 0};
-			inv_mpu_edmp_gaf_set_bias(st, gyr_bias, 0, 0);
-		}
-
-		/* Load MRM firmware image */
-		inv_mpu_edmp_mrm_init(st);
-	}
-
 	if (st->chip_config.has_compass || st->chip_config.has_pressure) {
 		inv_setup_i2cm(st);
 	}
@@ -586,6 +530,7 @@ int inv_mpu_initialize(struct inv_mpu_state *st)
 			pr_err("pressure setup failed\n");
 
 	}
+
 
 	pr_info("%s: initialize result is %d....\n", __func__, result);
 

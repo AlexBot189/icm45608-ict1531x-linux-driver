@@ -43,10 +43,6 @@
 #include <linux/iio/trigger.h>
 #include <linux/iio/trigger_consumer.h>
 
-#if defined(CONFIG_INV_MPU_IIO_ICM45600)
-#include "edmp/inv_mpu_edmp_gaf.h"
-#endif
-
 #ifdef CONFIG_INV_MPU_IIO_ICM20648
 #include "icm20648/dmp3Default.h"
 #endif
@@ -99,10 +95,13 @@
 #define COMPASS_CALIB_HDR        11
 #define STEP_COUNTER_HDR         12
 #define STEP_DETECTOR_HDR        13
+
 #define STEP_COUNT_HDR           14
 #define ACTIVITY_HDR             15
 #define PICK_UP_HDR              16
 #define EMPTY_MARKER             17
+#define MAGRAW_HDR               22
+#define MAGBIAS_HDR              23
 #define END_MARKER               18
 #define COMPASS_ACCURACY_HDR     19
 #define ACCEL_ACCURACY_HDR       20
@@ -431,6 +430,8 @@ struct inv_chip_config_s {
 	u32 activity_on:1;
 	u32 activity_eng_on:1;
 	u32 firmware_loaded:1;
+	u32 gaf_enabled:1;
+	u32 mag_initialized:1;
 	u32 low_power_gyro_on:1;
 	u32 wake_on:1;
 	int compass_rate;
@@ -939,10 +940,6 @@ struct inv_mpu_state {
 	u8 smplrt_div;
 	s64 it_timestamp;
 	bool no_fifo;
-#if defined(CONFIG_INV_MPU_IIO_ICM45600)
-	struct gaf_fifo_output gaf_output;
-	bool gaf_enabled;
-#endif
 };
 
 /**

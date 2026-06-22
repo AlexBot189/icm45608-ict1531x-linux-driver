@@ -13,10 +13,6 @@
 #define pr_fmt(fmt) "inv_mpu: " fmt
 
 #include "../inv_mpu_iio.h"
-#include "inv_slave_compass_ict1531x.h"
-
-/* External slave definition from inv_slave_compass_ict1531x.c */
-extern struct inv_mpu_slave slave_ict1531x;
 
 /* AKM definitions */
 #define REG_AKM_ID			0x00
@@ -199,9 +195,6 @@ int inv_mpu_setup_compass_slave(struct inv_mpu_state *st)
 	case COMPASS_ID_AK09915:
 	case COMPASS_ID_AK09916:
 		st->slave_compass = &slave_akm;
-		break;
-	case COMPASS_ID_ICT1531X:
-		st->slave_compass = &slave_ict1531x;
 		break;
 	default:
 		return -EINVAL;

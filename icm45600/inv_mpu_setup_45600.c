@@ -13,7 +13,7 @@
 #define pr_fmt(fmt) "inv_mpu: " fmt
 #include <linux/math64.h>
 #include "../inv_mpu_iio.h"
-#include "../edmp/inv_mpu_edmp_gaf.h"
+#include "inv_mpu_gaf.h"
 
 static int inv_get_actual_duration(int rate)
 {
@@ -101,12 +101,12 @@ static int init_i2cm_block(struct inv_mpu_state *st)
 	int rc = 0;
 	u8 data;
 
-	/* Configure AUX1 pads for I2CM */
+	/* Configure AUX1 pads for I2CM (match MCU inv_imu_init_i2cm: only mode bits) */
 	rc |= inv_plat_read(st, REG_IOC_PAD_SCENARIO_AUX_OVRD_DREG_BANK1, 1, &data);
-	data |= REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_ENABLE_OVRD_VAL_MASK |
+	data |= REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_MODE_OVRD_MASK |
+		(1 << REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_MODE_OVRD_VAL_POS) |
 		REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_ENABLE_OVRD_MASK |
-		REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_MODE_OVRD_MASK |
-		(1 << REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_MODE_OVRD_VAL_POS);
+		REG_IOC_PAD_SCENARIO_AUX_OVRD_AUX1_ENABLE_OVRD_VAL_MASK;
 	rc |= inv_plat_single_write(st, REG_IOC_PAD_SCENARIO_AUX_OVRD_DREG_BANK1, data);
 
 	/* Use reStart to bridge register address W and register data R transition */
@@ -179,10 +179,12 @@ static int inv_turn_on_fifo(struct inv_mpu_state *st)
 		if (st->chip_config.high_res_mode)
 			fifo_config3 |= BIT_FIFO_HIRES_EN;
 
-		if (st->sensor[SENSOR_COMPASS].on)
+		if (st->sensor[SENSOR_COMPASS].on ||
+		    st->chip_config.gaf_enabled)
 			fifo_config3 |= REG_FIFO_CONFIG3_FIFO_ES0_EN_MASK;
 
-		if (st->sensor[SENSOR_PRESSURE].on)
+		if (st->sensor[SENSOR_PRESSURE].on ||
+		    st->chip_config.gaf_enabled)
 			fifo_config3 |= REG_FIFO_CONFIG3_FIFO_ES1_EN_MASK;
 
 		if (st->sensor[SENSOR_GYRO].on ||
@@ -197,6 +199,11 @@ static int inv_turn_on_fifo(struct inv_mpu_state *st)
 	r = inv_plat_single_write(st, REG_FIFO_CONFIG3_DREG_BANK1, fifo_config3);
 	if (r)
 		return r;
+
+	/* GAF: ES0 must be 9-byte mode */
+	if (st->chip_config.gaf_enabled)
+		inv_plat_single_write(st, REG_FIFO_CONFIG4_DREG_BANK1,
+				     REG_FIFO_CONFIG4_FIFO_ES0_6B_9B_MASK);
 
 	r = inv_plat_single_write(st, REG_FIFO_CONFIG1_0_DREG_BANK1,
 		st->batch.fifo_wm_th & 0xff);
@@ -772,6 +779,11 @@ static int inv_set_batch(struct inv_mpu_state *st)
 			st->batch.pk_size = 20;
 	}
 
+	/* GAF: ES0(9B) + ES1(6B) => 32-byte FIFO packet */
+	if (st->chip_config.gaf_enabled &&
+	    st->sensor[SENSOR_ACCEL].on && st->sensor[SENSOR_GYRO].on)
+		st->batch.pk_size = 32;
+
 	pr_debug("final_pk_size=%d\n", st->batch.pk_size);
 
 
@@ -1162,20 +1174,7 @@ static int inv_enable_apex_gestures(struct inv_mpu_state *st)
 
 	if (apex_en0 || apex_en1 || st->chip_config.slave_enable) {
 		apex_en1 |= (REG_EDMP_APEX_EN1_EDMP_ENABLE_MASK);
-
-		/* Enable GAF fusion for ICT1531x magnetometer */
-		if (st->chip_config.has_compass &&
-		    st->plat_data.sec_slave_id == COMPASS_ID_ICT1531X) {
-			/* Set GAF mode: gyro + mag */
-			inv_mpu_edmp_gaf_set_mode(st, 1, 1);
-			/* Enable GAF FIFO push */
-			inv_mpu_edmp_gaf_start_fifo_push(st);
-			/* Enable GAF fusion in eDMP */
-			inv_mpu_edmp_gaf_enable(st);
-			/* Enable auto MRM */
-			inv_mpu_edmp_mrm_enable_auto(st);
-			pr_info("GAF fusion enabled for ICT1531x\n");
-		}
+			//REG_EDMP_APEX_EN1_DMP_SOFT_HARD_IRON_CORR_EN_MASK);
 	}
 
 
@@ -1470,6 +1469,11 @@ int set_inv_enable(struct iio_dev *indio_dev)
 		return 0;
 	}
 
+	/* GAF: unconditionally enable FIFO GAF support (ICM-45608 always supports it).
+	 * Must be set before inv_set_rate() so pk_size=32 is configured correctly.
+	 * inv_mpu_gaf_init() called later does the actual hardware init. */
+	st->chip_config.gaf_enabled = 1;
+
 	res = inv_set_rate(st);
 	if (res) {
 		pr_err("inv_set_rate error\n");
@@ -1489,6 +1493,15 @@ int set_inv_enable(struct iio_dev *indio_dev)
 			pr_err("inv_enable_apex_gestures error\n");
 			return res;
 		}
+	}
+
+	/* GAF init — align with MCU main.c:77 icm_45608_init() position.
+	 * Called once per sensor enable to configure GAF before FIFO starts.
+	 * Try 9-axis first, fallback to 6-axis if mag absent. */
+	if (st->chip_config.gaf_enabled) {
+		res = inv_mpu_gaf_init(st, 1);
+		if (res)
+			pr_err("GAF: init failed in enable path=%d\n", res);
 	}
 
 	res = inv_reset_fifo(st, false);

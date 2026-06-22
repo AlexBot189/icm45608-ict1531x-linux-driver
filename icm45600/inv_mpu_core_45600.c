@@ -32,7 +32,7 @@
 #include <linux/firmware.h>
 
 #include "../inv_mpu_iio.h"
-#include "../edmp/inv_mpu_edmp_gaf.h"
+#include "inv_mpu_gaf.h"
 
 static const struct inv_hw_s hw_info[INV_NUM_PARTS] = {
 	[ICM45600] = {128, "icm45600"},
@@ -81,20 +81,23 @@ static int inv_check_firmware_load(struct inv_mpu_state *st)
 	if (st->chip_config.firmware_loaded)
 		return 0;
 
+	/* Step 1: Load optional EDMP .bin firmware (MRM extensions etc.) */
 	if (request_firmware(&fw_entry,
-			"inv_dmpfirmware_icm45600.bin", st->dev) != 0) {
-		pr_info("DMP Firmware not available\n");
-		return -1;
+			"edmp-gaf-dynprot-icm45608.bin", st->dev) != 0) {
+		pr_info("GAF: DMP .bin firmware not available, skipping EDMP write\n");
+	} else {
+		crc =  crc32(0, fw_entry->data, fw_entry->size);
+		pr_info("GAF: fw crc32=%x, size=%zu\n", crc, fw_entry->size);
+
+		res = inv_ireg_write(st, EDMP_START_ADDR,
+					fw_entry->size, (u8 *)fw_entry->data);
+		release_firmware(fw_entry);
+
+		if (res)
+			pr_warn("GAF: EDMP firmware write failed (ret=%d)\n", res);
 	}
 
-	crc =  crc32(0, fw_entry->data, fw_entry->size);
-	//DMP: edmp_ram_b2s_image.h crc32=e67fbc1b, size= 1240
-	pr_info("crc32=%x, size=%zu\n", crc, fw_entry->size);
-
-	res = inv_ireg_write(st, EDMP_START_ADDR,
-					fw_entry->size, (u8 *)fw_entry->data);
 	st->chip_config.firmware_loaded = 1;
-	release_firmware(fw_entry);
 
 	return 0;
 }
